@@ -1,0 +1,143 @@
+# ParkPulse
+
+A parking marketplace (Airbnb-for-parking): hosts list private parking spaces; drivers search, book, pay, park, and review. Built as Spring Boot microservices in a Maven monorepo.
+
+**Status:** Phases 0–8 done (bootstrap, contracts, Gateway + Identity, Profile, Listing, Booking, Payment, Search, Notification). See [docs/PROGRESS.md](docs/PROGRESS.md).
+
+## Design docs
+- [Services & Entities](docs/ParkSmart-Services-and-Entities.md): authoritative service boundaries, entities, schema
+- [Architecture Review](docs/ParkSmart-Architecture-Review.md): rationale, APIs, events, booking saga, security
+- [Vertical slice plan](docs/plans/01-vertical-slice.md) and the OpenAPI contracts in [docs/openapi](docs/openapi)
+
+## Prerequisites
+- JDK 21+ (`JAVA_HOME` must point to it)
+- Docker Desktop (local infra and Testcontainers)
+- Maven is optional; use the wrapper (`./mvnw` in Git Bash, `.\mvnw.cmd` in PowerShell)
+
+## First-time setup
+```bash
+git config core.hooksPath .githooks       # enables the commit-msg hook
+bash infra/scripts/init-local-env.sh      # creates .env with random local-only passwords
+```
+
+## Build
+```bash
+./mvnw verify                             # everything (unit + Testcontainers integration tests)
+./mvnw -pl services/<name> -am verify     # one service and what it depends on
+./mvnw spotless:apply                     # fix formatting
+```
+
+## Local infrastructure
+```bash
+docker compose --env-file .env -f infra/docker-compose.yml up -d
+docker compose --env-file .env -f infra/docker-compose.yml --profile search up -d   # with OpenSearch
+docker compose --env-file .env -f infra/docker-compose.yml down
+```
+
+| Component | Port | Notes |
+|---|---|---|
+| Postgres 17 + PostGIS 3.7 | 5432 | One DB + role per service: identity, profile, listing, booking, payment, review, notification, search |
+| Kafka 4.1 (KRaft) | 9092 | Auto topic creation off; services declare their topics and `.DLT` topics |
+| Redis 8.6 | 6380 | Password from `.env` (6380 avoids clashing with a host Redis on 6379) |
+| RustFS (S3-compatible) | 9000 / 9001 | Local stand-in for S3; console on 9001 |
+| OpenSearch 2.19 | 9200 | Only with `--profile search` |
+
+## Running locally
+
+Windows, Git Bash, from the repo root. JDK 21+ is required; the scripts fall back to
+`C:\Program Files\Java\jdk-22` when the shell's `java` is older.
+
+```bash
+export JAVA_HOME="/c/Program Files/Java/jdk-22" PATH="/c/Program Files/Java/jdk-22/bin:$PATH"
+java -version                                  # must say 21 or newer
+bash infra/scripts/init-local-env.sh           # once: creates the root env file with random passwords
+./mvnw spotless:apply && ./mvnw clean package -DskipTests
+bash infra/scripts/infra-up.sh                 # Postgres, Kafka, Redis, S3; waits until healthy
+bash infra/scripts/run-local.sh                # 10 services in the background, waits for /actuator/health UP
+bash infra/scripts/smoke-test.sh               # end-to-end check through the gateway
+bash infra/scripts/stop-local.sh               # stop the services (docker keeps running)
+```
+
+Logs are in `logs/<service>.log` (gitignored), PIDs in `logs/pids`. `run-local.sh <name>...` starts only
+the named services.
+
+| Service | URL |
+|---|---|
+| Gateway (use this for all API calls) | http://localhost:8080 |
+| Identity / Profile / Listing / Booking | :8081 / :8082 / :8083 / :8084 |
+| Payment / Search / Notification / Review / Admin BFF | :8085 / :8086 / :8087 / :8088 / :8089 |
+| Health | `http://localhost:<port>/actuator/health` |
+| Object storage console | http://localhost:9001 |
+
+Notes:
+- Verification codes are logged by Notification (`logs/notification.log`, "DEV ONLY body"), not by Identity.
+- The gateway limits register/login per IP (5 logins burst, then one per 3 minutes). The smoke test
+  calls Identity on :8081 for register/login/verify so it can be repeated; everything else goes through :8080.
+- There is no public way to become ADMIN. The smoke test inserts an `ADMIN` row into the identity DB through
+  the postgres container (local only).
+- Not exercised by the smoke test: booking completion and reviews (the booking window must elapse).
+
+## Services
+Run any service from the repo root with the `local` profile (reads `.env`):
+```bash
+java -jar services/<name>/target/<name>-service-0.1.0-SNAPSHOT.jar --spring.profiles.active=local
+```
+
+| Service | Port | What it does |
+|---|---|---|
+| gateway | 8080 | Single entry point: routing, edge JWT check, Redis rate limits, correlation IDs; blocks `/internal/**` |
+| admin-bff | 8089 | ADMIN-only composed views, no data of its own: the listing moderation queue (with host profiles) and approve/reject, review hiding, and a booking case view (booking + payment + listing + both profiles) with manual refunds. Calls Listing, Profile, Booking, Payment and Review with the admin's own token (2 s timeouts); a failing secondary lookup marks the view `partial` instead of failing it. Owns `/admin/v1/moderation/**` and `/admin/v1/bookings/**` at the gateway |
+| identity | 8081 | Accounts, login, refresh-token rotation, email/phone verification, roles, JWKS |
+| notification | 8087 | Turns events into in-app notices and emails (and SMS for phone codes), honouring Profile's channel preferences; retries with backoff, dead-letters after 5 attempts, redacts one-time codes. Locally it "sends" by logging, and the log shows codes ("DEV ONLY") |
+| search | 8086 | Public geo search (radius, price, vehicle size, amenities, instant book, optional time window with weekly rules, blackouts and known bookings) over a projection built only from Listing, Booking, Payment and Review events |
+| payment | 8085 | Payment intents created from BookingRequested; driver authorizes with a processor token (FakeProcessor: `fake_ok`, `fake_decline`, `fake_capture_fail`); capture on confirmation, void on expiry/decline, policy refunds on cancellation; double-entry ledger with 15% commission; weekly host payouts and earnings |
+| booking | 8084 | Bookings: idempotent create (holds the slot; a Postgres exclusion constraint makes overlaps impossible), the payment saga (PaymentAuthorized → CONFIRMED or host approval), cancellations with policy refunds, check-in/out, and timers for payment expiry, host deadline, no-show and completion |
+| listing | 8083 | Listings (DRAFT → review → PUBLISHED ↔ PAUSED, ARCHIVED), photos, weekly availability and blackouts, admin moderation, and the internal booking quote. Tracks host eligibility (verified phone, profile photo, suspension) and active bookings from events |
+| profile | 8082 | Profiles and presigned photo uploads, vehicles, host payout accounts, notification preferences. Consumes `AccountRegistered` and driver ratings; publishes `ProfileUpdated`, `VehicleAdded`, `VehicleRemoved` |
+
+Contracts: [identity](docs/openapi/identity.yaml), [profile](docs/openapi/profile.yaml), [search](docs/openapi/search.yaml), [listing](docs/openapi/listing.yaml), [booking](docs/openapi/booking.yaml), [payment](docs/openapi/payment.yaml), [admin-bff](docs/openapi/admin-bff.yaml).
+
+### Profile photo upload (through the gateway)
+1. `POST /api/v1/profiles/me/photo/upload-urls {"contentType":"image/png","contentLength":12345}` returns `uploadId`, a presigned `uploadUrl` (10 min) and `requiredHeaders`.
+2. `PUT` the bytes to `uploadUrl` with those headers (directly to object storage).
+3. `POST /api/v1/profiles/me/photo/uploads/{uploadId}/confirm`: the service checks size, type and the image signature, sets the photo, and emits `ProfileUpdated{hasPhoto=true}`.
+
+> **Just want to run it?** See [RUNNING.md](RUNNING.md): start-up steps, demo users and passwords, test cards and what to try.
+
+## Frontend
+`web/` is the ParkPulse web app for drivers, hosts and admins (React 18 + TypeScript + Vite): search with a map, listing
+pages, booking and test-mode checkout, check-in/out, reviews, a host dashboard with a listing wizard, earnings and payouts,
+account settings, and an admin console. Details in [web/README.md](web/README.md).
+
+```bash
+cd web && npm install
+npm run dev                # http://localhost:5173 (stack must be running: infra/scripts/run-local.sh)
+npm run dev:direct-auth    # same, but /api/v1/auth/* goes straight to Identity (skips the gateway login/register limits)
+npm run build && npm run test
+bash infra/scripts/infra-up.sh --profile web     # production image (nginx) on http://localhost:3000
+bash web/scripts/make-admin.sh you@example.com   # local-only ADMIN grant (same trick as smoke-test.sh)
+node web/scripts/seed-demo.mjs                   # demo users and data (see RUNNING.md)
+```
+
+The browser only talks to its own origin: the Vite dev server (development) or nginx (production image) proxies `/api` and
+`/admin/v1` to the gateway and presigned uploads to object storage, so the gateway needs no CORS. Payments run in test mode
+(card `4242 4242 4242 4242`). The dev server adds a debug panel and a Dev tools page that reads verification codes from
+`logs/notification.log`; neither exists in the production build.
+
+## Layout
+```
+pom.xml                 parent POM (Boot 3.5, Spring Cloud 2025.0, Spotless, enforcer)
+shared/common-events    event envelope, catalog, payload records, JSON Schemas
+shared/common-web       ProblemDetail handling, pagination, correlation ID
+shared/common-security  JWT resource-server support, roles, CurrentAccount
+services/               one module per service
+tools/                  build-time contract validation
+infra/                  docker-compose, Postgres init, local env script
+web/                    React + Vite web app (drivers, hosts, admins); nginx image
+docs/                   design docs, PROGRESS.md, openapi/, plans/
+.claude/                Claude Code settings, hooks, subagents, slash commands
+.githooks/              commit-msg hook
+```
+
+## Working with Claude Code
+See [CLAUDE.md](CLAUDE.md). Slash commands: `/new-service <name>`, `/verify-service <name>`, `/phase-done <n>`.
